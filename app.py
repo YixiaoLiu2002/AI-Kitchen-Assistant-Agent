@@ -264,17 +264,21 @@ def should_use_knowledge(user_input: str, messages: list[dict[str, str]]) -> boo
     return any(keyword in recent_user_text for keyword in NUTRITION_KEYWORDS)
 
 
-def get_attached_guideline_files(client: genai.Client) -> list[object]:
-    files: list[object] = []
+def get_attached_guideline_parts(client: genai.Client) -> list[types.Part]:
+    parts: list[types.Part] = []
     used_labels: list[str] = []
     errors: list[str] = []
 
     for spec in GUIDELINE_SPECS:
         entry = ensure_guideline_loaded(client, spec)
-        if entry["status"] == "loaded" and entry["file_uri"]:
+        if entry["status"] == "loaded" and entry["file_uri"] and entry["mime_type"]:
             try:
-                uploaded_file = client.files.get(name=entry["file_name"])
-                files.append(uploaded_file)
+                parts.append(
+                    types.Part.from_uri(
+                        file_uri=entry["file_uri"],
+                        mime_type=entry["mime_type"],
+                    )
+                )
                 used_labels.append(entry["label"])
             except Exception as exc:
                 errors.append(f"{entry['label']}: {exc}")
@@ -283,24 +287,34 @@ def get_attached_guideline_files(client: genai.Client) -> list[object]:
 
     st.session_state.knowledge_last_request_used = used_labels
     st.session_state.knowledge_last_request_errors = errors
-    return files
+    return parts
 
 
 def build_contents(
     messages: list[dict[str, str]],
-    knowledge_files: list[object] | None = None,
-) -> list[object]:
-    contents: list[object] = []
+    knowledge_parts: list[types.Part] | None = None,
+) -> list[types.Content]:
+    contents: list[types.Content] = []
 
-    if knowledge_files:
+    if knowledge_parts:
         # When nutrition-related requests need guideline support, the uploaded PDF
-        # file objects are attached directly to the Gemini request here.
+        # references are attached directly to the Gemini request here.
         contents.append(
-            "Use the attached U.S. Dietary Guidelines and Chinese Dietary Guidelines "
-            "as reference documents when relevant. If the documents do not contain "
-            "enough information, say so instead of inventing details."
+            types.Content(
+                role="user",
+                parts=[
+                    types.Part.from_text(
+                        text=(
+                            "Use the attached U.S. Dietary Guidelines and Chinese "
+                            "Dietary Guidelines as reference documents when relevant. "
+                            "If the documents do not contain enough information, say so "
+                            "instead of inventing details."
+                        )
+                    ),
+                    *knowledge_parts,
+                ],
+            )
         )
-        contents.extend(knowledge_files)
 
     for message in messages:
         if message["role"] == "assistant":
@@ -311,7 +325,12 @@ def build_contents(
                 )
             )
         else:
-            contents.append(message["content"])
+            contents.append(
+                types.Content(
+                    role="user",
+                    parts=[types.Part.from_text(text=message["content"])],
+                )
+            )
     return contents
 
 
@@ -321,16 +340,16 @@ def generate_reply(
     messages: list[dict[str, str]],
     user_input: str,
 ) -> str:
-    knowledge_files: list[object] = []
+    knowledge_parts: list[types.Part] = []
     st.session_state.knowledge_last_request_used = []
     st.session_state.knowledge_last_request_errors = []
 
     if should_use_knowledge(user_input, messages):
-        knowledge_files = get_attached_guideline_files(client)
+        knowledge_parts = get_attached_guideline_parts(client)
 
     response = client.models.generate_content(
         model=model_name,
-        contents=build_contents(messages, knowledge_files=knowledge_files),
+        contents=build_contents(messages, knowledge_parts=knowledge_parts),
         config=types.GenerateContentConfig(
             system_instruction=SYSTEM_PROMPT,
             temperature=0.3,
