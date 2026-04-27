@@ -178,6 +178,10 @@ h1, h2, h3, p, label, div, span {
     padding: 0.2rem 0;
 }
 
+[data-testid="stChatMessage"] > div {
+    border-radius: 20px;
+}
+
 [data-testid="stChatMessage"] [data-testid="stMarkdownContainer"] {
     border-radius: 18px;
     padding: 0.95rem 1rem;
@@ -185,12 +189,30 @@ h1, h2, h3, p, label, div, span {
     box-shadow: 0 6px 20px rgba(36, 49, 47, 0.04);
 }
 
+[data-testid="stChatMessage"]:has([data-testid="chatAvatarIcon-user"]) > div {
+    background: var(--user-bubble);
+}
+
 [data-testid="stChatMessage"]:has([data-testid="chatAvatarIcon-user"]) [data-testid="stMarkdownContainer"] {
     background: var(--user-bubble);
 }
 
+[data-testid="stChatMessage"]:has([data-testid="chatAvatarIcon-assistant"]) > div {
+    background: var(--assistant-bubble);
+}
+
 [data-testid="stChatMessage"]:has([data-testid="chatAvatarIcon-assistant"]) [data-testid="stMarkdownContainer"] {
     background: var(--assistant-bubble);
+}
+
+[data-testid="chatAvatarIcon-user"] {
+    background: #F2C14E !important;
+    color: #24312F !important;
+}
+
+[data-testid="chatAvatarIcon-assistant"] {
+    background: #4E9F8A !important;
+    color: #ffffff !important;
 }
 
 [data-testid="stExpander"] {
@@ -486,21 +508,32 @@ def render_sidebar() -> None:
             clear_chat()
             st.rerun()
 
-        st.markdown('<div class="sidebar-card"><div class="sidebar-card-title">Knowledge Status</div>', unsafe_allow_html=True)
+        knowledge_lines: list[str] = []
         for spec in GUIDELINE_SPECS:
             status = st.session_state.knowledge_status.get(spec["key"], {})
-            st.caption(f"{spec['label']}: {status.get('status', 'missing')}")
+            status_text = status.get("status", "missing")
+            knowledge_lines.append(f"<p>{spec['label']}: {status_text}</p>")
             if status.get("error"):
-                st.warning(f"{spec['label']}: {status['error']}", icon="⚠️")
+                knowledge_lines.append(f"<p>{spec['label']}: {status['error']}</p>")
 
         if st.session_state.knowledge_last_request_used:
-            st.caption(
-                "Used in latest nutrition request: "
+            knowledge_lines.append(
+                "<p>Used in latest nutrition request: "
                 + ", ".join(st.session_state.knowledge_last_request_used)
+                + "</p>"
             )
         else:
-            st.caption("Guideline text files are attached only for nutrition-related questions.")
-        st.markdown("</div>", unsafe_allow_html=True)
+            knowledge_lines.append(
+                "<p>Guideline text files are attached only for nutrition-related questions.</p>"
+            )
+
+        st.markdown(
+            '<div class="sidebar-card">'
+            '<div class="sidebar-card-title">Knowledge Status</div>'
+            + "".join(knowledge_lines)
+            + "</div>",
+            unsafe_allow_html=True,
+        )
 
 
 def render_usage_footer() -> None:
