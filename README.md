@@ -50,4 +50,5 @@ GEMINI_API_KEY = "your-api-key-here"
 - The API key is loaded from `st.secrets["GEMINI_API_KEY"]`.
 - No database, login, long-term storage, or external memory layer is included yet.
 - Optional reference files can be placed in `knowledge/`. Nutrition and diet-related questions will try to attach the PDF guides there first, then fall back to any `.txt` summaries in the same folder if needed.
+- Expected PDF names in `knowledge/` are `us_dietary_guidelines.pdf` and `chinese_dietary_guidelines.pdf`.
 - If PDF attachment is unavailable, the app can extract local fallback text with `pypdf` and save `.txt` files next to the PDFs.

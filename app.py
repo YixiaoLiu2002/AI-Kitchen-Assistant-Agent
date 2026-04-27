@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 import time
 from pathlib import Path
 
@@ -20,12 +21,12 @@ GUIDELINE_SPECS = [
     {
         "key": "us_guidelines",
         "label": "U.S. Dietary Guidelines",
-        "filename": "DGA 美国居民膳食指南.pdf",
+        "filename": "us_dietary_guidelines.pdf",
     },
     {
         "key": "cn_guidelines",
         "label": "Chinese Dietary Guidelines",
-        "filename": "中国居民膳食指南(1).pdf",
+        "filename": "chinese_dietary_guidelines.pdf",
     },
 ]
 NUTRITION_KEYWORDS = {
@@ -79,6 +80,7 @@ NUTRITION_KEYWORDS = {
 }
 FILE_READY_TIMEOUT_SECONDS = 90
 FILE_READY_POLL_SECONDS = 2
+UPLOAD_TMP_DIR = KNOWLEDGE_DIR / ".upload_tmp"
 
 
 def init_session_state() -> None:
@@ -102,6 +104,11 @@ def get_gemini_client(api_key: str) -> genai.Client:
 def guideline_path(filename: str) -> Path:
     # Local PDF files are loaded from the knowledge/ folder.
     return KNOWLEDGE_DIR / filename
+
+
+def ascii_upload_path(spec: dict[str, str]) -> Path:
+    suffix = guideline_path(spec["filename"]).suffix or ".pdf"
+    return UPLOAD_TMP_DIR / f"{spec['key']}{suffix}"
 
 
 def default_knowledge_entry(spec: dict[str, str]) -> dict[str, str]:
@@ -154,6 +161,14 @@ def wait_for_file_active(client: genai.Client, file_name: str) -> object:
     raise TimeoutError(f"{file_name} did not become ACTIVE before timeout.")
 
 
+def prepare_ascii_upload_copy(spec: dict[str, str]) -> Path:
+    source_path = guideline_path(spec["filename"])
+    UPLOAD_TMP_DIR.mkdir(parents=True, exist_ok=True)
+    temp_path = ascii_upload_path(spec)
+    shutil.copyfile(source_path, temp_path)
+    return temp_path
+
+
 def upload_guideline_file(client: genai.Client, spec: dict[str, str]) -> dict[str, str]:
     path = guideline_path(spec["filename"])
     entry = default_knowledge_entry(spec)
@@ -164,7 +179,8 @@ def upload_guideline_file(client: genai.Client, spec: dict[str, str]) -> dict[st
     try:
         # The PDF is uploaded to Gemini Files API once and its reference is saved
         # in session state so we do not re-upload on every chat turn.
-        uploaded_file = client.files.upload(file=str(path))
+        safe_upload_path = prepare_ascii_upload_copy(spec)
+        uploaded_file = client.files.upload(file=str(safe_upload_path))
         active_file = wait_for_file_active(client, uploaded_file.name)
         entry.update(
             {
