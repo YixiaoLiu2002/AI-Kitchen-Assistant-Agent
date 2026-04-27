@@ -2,12 +2,10 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
-from typing import Any
 
 import streamlit as st
 from google import genai
 from google.genai import types
-from pypdf import PdfReader
 
 from prompt import SYSTEM_PROMPT
 
@@ -18,9 +16,17 @@ INTRO_TEXT = (
     "reduce food waste, and estimate basic nutrition."
 )
 KNOWLEDGE_DIR = Path(__file__).parent / "knowledge"
-KNOWLEDGE_PDF_FILES = [
-    "DGA 美国居民膳食指南.pdf",
-    "中国居民膳食指南(1).pdf",
+GUIDELINE_SPECS = [
+    {
+        "key": "us_guidelines",
+        "label": "U.S. Dietary Guidelines",
+        "filename": "DGA 美国居民膳食指南.pdf",
+    },
+    {
+        "key": "cn_guidelines",
+        "label": "Chinese Dietary Guidelines",
+        "filename": "中国居民膳食指南(1).pdf",
+    },
 ]
 NUTRITION_KEYWORDS = {
     "nutrition",
@@ -29,16 +35,26 @@ NUTRITION_KEYWORDS = {
     "dietary",
     "calorie",
     "calories",
+    "meal balance",
+    "daily diet",
+    "daily summary",
+    "meal summary",
+    "healthy eating",
+    "weight loss",
+    "fat loss",
     "protein",
+    "carbohydrate",
+    "carbohydrates",
     "carb",
     "carbs",
     "fat",
     "fiber",
-    "sugar",
+    "vegetable",
+    "vegetables",
+    "fruit",
     "sodium",
-    "meal balance",
-    "daily diet",
-    "meal summary",
+    "sugar",
+    "oil",
     "health",
     "healthy",
     "减脂",
@@ -52,34 +68,30 @@ NUTRITION_KEYWORDS = {
     "碳水",
     "脂肪",
     "纤维",
-    "糖",
+    "蔬菜",
+    "水果",
     "钠",
+    "糖",
+    "油",
     "膳食",
     "健康",
     "总结今天",
 }
-PDF_READY_TIMEOUT_SECONDS = 45
-PDF_READY_POLL_SECONDS = 2
-PDF_FALLBACK_MAX_PAGES = 24
-PDF_FALLBACK_MAX_CHARS_PER_FILE = 18000
-
-
-def init_knowledge_state() -> None:
-    if "knowledge_runtime_warnings" not in st.session_state:
-        st.session_state.knowledge_runtime_warnings = []
-    if "knowledge_runtime_status" not in st.session_state:
-        st.session_state.knowledge_runtime_status = {
-            "last_triggered": False,
-            "last_mode": "not-used",
-            "loaded_files": [],
-            "fallback_files": [],
-            "errors": [],
-        }
+FILE_READY_TIMEOUT_SECONDS = 90
+FILE_READY_POLL_SECONDS = 2
 
 
 def init_session_state() -> None:
     if "messages" not in st.session_state:
         st.session_state.messages = []
+    if "knowledge_files" not in st.session_state:
+        st.session_state.knowledge_files = {}
+    if "knowledge_bootstrapped" not in st.session_state:
+        st.session_state.knowledge_bootstrapped = False
+    if "knowledge_last_request_used" not in st.session_state:
+        st.session_state.knowledge_last_request_used = []
+    if "knowledge_last_request_errors" not in st.session_state:
+        st.session_state.knowledge_last_request_errors = []
 
 
 @st.cache_resource
@@ -87,240 +99,201 @@ def get_gemini_client(api_key: str) -> genai.Client:
     return genai.Client(api_key=api_key)
 
 
-def get_knowledge_status() -> dict[str, list[Path] | list[str]]:
-    pdf_paths = [KNOWLEDGE_DIR / name for name in KNOWLEDGE_PDF_FILES]
-    existing_pdfs = [path for path in pdf_paths if path.exists()]
-    missing_pdfs = [path.name for path in pdf_paths if not path.exists()]
-    txt_paths = sorted(KNOWLEDGE_DIR.glob("*.txt")) if KNOWLEDGE_DIR.exists() else []
+def guideline_path(filename: str) -> Path:
+    # Local PDF files are loaded from the knowledge/ folder.
+    return KNOWLEDGE_DIR / filename
+
+
+def default_knowledge_entry(spec: dict[str, str]) -> dict[str, str]:
+    path = guideline_path(spec["filename"])
     return {
-        "pdfs": existing_pdfs,
-        "missing_pdfs": missing_pdfs,
-        "txts": txt_paths,
+        "label": spec["label"],
+        "filename": spec["filename"],
+        "path": str(path),
+        "status": "missing" if not path.exists() else "not uploaded",
+        "error": "",
+        "file_name": "",
+        "file_uri": "",
+        "mime_type": "application/pdf",
     }
 
 
-def update_knowledge_runtime_status(
+def sync_missing_statuses() -> None:
+    for spec in GUIDELINE_SPECS:
+        entry = st.session_state.knowledge_files.get(
+            spec["key"], default_knowledge_entry(spec)
+        )
+        path = guideline_path(spec["filename"])
+        if not path.exists():
+            entry.update(
+                {
+                    "status": "missing",
+                    "error": "Local PDF file not found.",
+                    "file_name": "",
+                    "file_uri": "",
+                }
+            )
+        elif entry["status"] == "missing":
+            entry.update({"status": "not uploaded", "error": ""})
+        st.session_state.knowledge_files[spec["key"]] = entry
+
+
+def wait_for_file_active(client: genai.Client, file_name: str) -> object:
+    deadline = time.time() + FILE_READY_TIMEOUT_SECONDS
+    last_file = client.files.get(name=file_name)
+
+    while time.time() < deadline:
+        state_name = getattr(getattr(last_file, "state", None), "name", None)
+        if state_name in {None, "ACTIVE"}:
+            return last_file
+        if state_name == "FAILED":
+            raise RuntimeError(f"{file_name} failed during Gemini file processing.")
+        time.sleep(FILE_READY_POLL_SECONDS)
+        last_file = client.files.get(name=file_name)
+
+    raise TimeoutError(f"{file_name} did not become ACTIVE before timeout.")
+
+
+def upload_guideline_file(client: genai.Client, spec: dict[str, str]) -> dict[str, str]:
+    path = guideline_path(spec["filename"])
+    entry = default_knowledge_entry(spec)
+    if not path.exists():
+        entry["error"] = "Local PDF file not found."
+        return entry
+
+    try:
+        # The PDF is uploaded to Gemini Files API once and its reference is saved
+        # in session state so we do not re-upload on every chat turn.
+        uploaded_file = client.files.upload(file=str(path))
+        active_file = wait_for_file_active(client, uploaded_file.name)
+        entry.update(
+            {
+                "status": "loaded",
+                "error": "",
+                "file_name": active_file.name,
+                "file_uri": active_file.uri,
+                "mime_type": active_file.mime_type or "application/pdf",
+            }
+        )
+    except Exception as exc:
+        entry.update(
+            {
+                "status": "upload failed",
+                "error": str(exc),
+                "file_name": "",
+                "file_uri": "",
+            }
+        )
+    return entry
+
+
+def ensure_guideline_loaded(
+    client: genai.Client,
+    spec: dict[str, str],
     *,
-    triggered: bool,
-    mode: str,
-    loaded_files: list[str] | None = None,
-    fallback_files: list[str] | None = None,
-    errors: list[str] | None = None,
-) -> None:
-    st.session_state.knowledge_runtime_status = {
-        "last_triggered": triggered,
-        "last_mode": mode,
-        "loaded_files": loaded_files or [],
-        "fallback_files": fallback_files or [],
-        "errors": errors or [],
-    }
+    force_reupload: bool = False,
+) -> dict[str, str]:
+    current = st.session_state.knowledge_files.get(
+        spec["key"], default_knowledge_entry(spec)
+    )
+    path = guideline_path(spec["filename"])
+    if not path.exists():
+        current.update(
+            {
+                "status": "missing",
+                "error": "Local PDF file not found.",
+                "file_name": "",
+                "file_uri": "",
+            }
+        )
+        st.session_state.knowledge_files[spec["key"]] = current
+        return current
+
+    if not force_reupload and current.get("file_name"):
+        try:
+            active_file = wait_for_file_active(client, current["file_name"])
+            current.update(
+                {
+                    "status": "loaded",
+                    "error": "",
+                    "file_name": active_file.name,
+                    "file_uri": active_file.uri,
+                    "mime_type": active_file.mime_type or "application/pdf",
+                }
+            )
+            st.session_state.knowledge_files[spec["key"]] = current
+            return current
+        except Exception:
+            pass
+
+    updated = upload_guideline_file(client, spec)
+    st.session_state.knowledge_files[spec["key"]] = updated
+    return updated
+
+
+def bootstrap_knowledge_files(client: genai.Client) -> None:
+    sync_missing_statuses()
+    if st.session_state.knowledge_bootstrapped:
+        return
+    for spec in GUIDELINE_SPECS:
+        ensure_guideline_loaded(client, spec)
+    st.session_state.knowledge_bootstrapped = True
 
 
 def should_use_knowledge(user_input: str, messages: list[dict[str, str]]) -> bool:
-    recent_text = " ".join(
+    recent_user_text = " ".join(
         [message["content"] for message in messages[-4:] if message["role"] == "user"]
         + [user_input]
     ).lower()
-    return any(keyword in recent_text for keyword in NUTRITION_KEYWORDS)
+    return any(keyword in recent_user_text for keyword in NUTRITION_KEYWORDS)
 
 
-@st.cache_data(show_spinner=False)
-def load_txt_knowledge(txt_paths: tuple[str, ...]) -> str:
-    chunks: list[str] = []
-    for path_str in txt_paths:
-        path = Path(path_str)
-        try:
-            chunks.append(f"Reference summary from {path.name}:\n{path.read_text(encoding='utf-8')}")
-        except UnicodeDecodeError:
-            chunks.append(
-                f"Reference summary from {path.name}:\n"
-                f"{path.read_text(encoding='utf-8', errors='ignore')}"
-            )
-    return "\n\n".join(chunks).strip()
-
-
-@st.cache_data(show_spinner=False)
-def extract_pdf_text_to_txt(
-    pdf_path_str: str,
-    file_size: int,
-    file_mtime: int,
-) -> tuple[str | None, str | None]:
-    del file_size, file_mtime
-    pdf_path = Path(pdf_path_str)
-    txt_path = pdf_path.with_suffix(".txt")
-
-    try:
-        reader = PdfReader(str(pdf_path))
-        chunks: list[str] = []
-        total_chars = 0
-
-        # Fallback path: if direct PDF upload is unavailable, extract a concise
-        # local text summary from the PDF and save it beside the source file.
-        for page in reader.pages[:PDF_FALLBACK_MAX_PAGES]:
-            page_text = (page.extract_text() or "").strip()
-            if not page_text:
-                continue
-
-            remaining = PDF_FALLBACK_MAX_CHARS_PER_FILE - total_chars
-            if remaining <= 0:
-                break
-
-            page_excerpt = page_text[:remaining]
-            chunks.append(page_excerpt)
-            total_chars += len(page_excerpt)
-
-        if not chunks:
-            return None, f"{pdf_path.name}: no extractable text found"
-
-        summary_text = (
-            f"Extracted reference text from {pdf_path.name} "
-            f"(first {min(len(reader.pages), PDF_FALLBACK_MAX_PAGES)} pages, truncated):\n\n"
-            + "\n\n".join(chunks)
-        )
-        txt_path.write_text(summary_text, encoding="utf-8")
-        return str(txt_path), None
-    except Exception as exc:
-        return None, f"{pdf_path.name}: text extraction failed ({exc})"
-
-
-def wait_for_uploaded_file_ready(client: genai.Client, uploaded_file: Any) -> Any:
-    deadline = time.time() + PDF_READY_TIMEOUT_SECONDS
-    current_file = uploaded_file
-
-    while time.time() < deadline:
-        state_name = getattr(getattr(current_file, "state", None), "name", None)
-        if state_name in {None, "ACTIVE"}:
-            return current_file
-        if state_name == "FAILED":
-            raise RuntimeError(f"file processing failed for {current_file.name}")
-        time.sleep(PDF_READY_POLL_SECONDS)
-        current_file = client.files.get(name=current_file.name)
-
-    raise TimeoutError(f"timed out waiting for {current_file.name} to become ACTIVE")
-
-
-@st.cache_resource(show_spinner=False)
-def upload_knowledge_pdfs(
-    api_key: str, pdf_keys: tuple[tuple[str, int, int], ...]
-) -> tuple[list[tuple[str, str, str]], list[str]]:
-    client = genai.Client(api_key=api_key)
-    uploaded_parts: list[tuple[str, str, str]] = []
+def get_attached_guideline_parts(client: genai.Client) -> list[types.Part]:
+    parts: list[types.Part] = []
+    used_labels: list[str] = []
     errors: list[str] = []
 
-    # Knowledge PDFs are loaded from knowledge/ and uploaded once so they can be
-    # attached to Gemini requests only when a nutrition-related question needs them.
-    for path_str, _size, _mtime in pdf_keys:
-        path = Path(path_str)
-        try:
-            uploaded_file = client.files.upload(file=str(path))
-            uploaded_file = wait_for_uploaded_file_ready(client, uploaded_file)
-            uploaded_parts.append(
-                (path.name, uploaded_file.uri, uploaded_file.mime_type or "application/pdf")
-            )
-        except Exception as exc:
-            errors.append(f"{path.name}: {exc}")
-
-    return uploaded_parts, errors
-
-
-def get_knowledge_parts(api_key: str) -> tuple[list[types.Part], list[str], str]:
-    status = get_knowledge_status()
-    warnings: list[str] = []
-    load_errors: list[str] = []
-    fallback_files: list[str] = []
-
-    pdfs = status["pdfs"]
-    if pdfs:
-        pdf_keys = tuple(
-            (str(path), path.stat().st_size, int(path.stat().st_mtime)) for path in pdfs
-        )
-        uploaded_parts, upload_errors = upload_knowledge_pdfs(api_key, pdf_keys)
-        if uploaded_parts:
-            parts = [
-                types.Part.from_uri(file_uri=file_uri, mime_type=mime_type)
-                for _name, file_uri, mime_type in uploaded_parts
-            ]
-            if upload_errors:
-                load_errors.extend(upload_errors)
-                warnings.append(
-                    "Some knowledge PDFs could not be attached; using the ones that uploaded successfully."
+    for spec in GUIDELINE_SPECS:
+        entry = ensure_guideline_loaded(client, spec)
+        if entry["status"] == "loaded" and entry["file_uri"]:
+            parts.append(
+                types.Part.from_uri(
+                    file_uri=entry["file_uri"],
+                    mime_type=entry["mime_type"],
                 )
-            update_knowledge_runtime_status(
-                triggered=True,
-                mode="pdf",
-                loaded_files=[name for name, _uri, _mime in uploaded_parts],
-                errors=load_errors,
             )
-            return parts, warnings, "pdf"
-        load_errors.extend(upload_errors)
-        warnings.append(
-            "Knowledge PDFs were found, but Gemini attachment failed. Trying local .txt knowledge summaries instead."
-        )
+            used_labels.append(entry["label"])
+        else:
+            errors.append(f"{entry['label']}: {entry['status']}")
 
-    txt_paths_list = [str(path) for path in status["txts"]]
-    if not txt_paths_list and pdfs:
-        for path in pdfs:
-            txt_path_str, extraction_error = extract_pdf_text_to_txt(
-                str(path), path.stat().st_size, int(path.stat().st_mtime)
-            )
-            if txt_path_str:
-                txt_paths_list.append(txt_path_str)
-                fallback_files.append(Path(txt_path_str).name)
-            elif extraction_error:
-                load_errors.append(extraction_error)
-
-    txt_paths = tuple(txt_paths_list)
-    if txt_paths:
-        txt_content = load_txt_knowledge(txt_paths)
-        if txt_content:
-            if not fallback_files:
-                fallback_files = [Path(path).name for path in txt_paths]
-            update_knowledge_runtime_status(
-                triggered=True,
-                mode="txt",
-                fallback_files=fallback_files,
-                errors=load_errors,
-            )
-            return [types.Part.from_text(text=txt_content)], warnings, "txt"
-
-    if pdfs:
-        warnings.append(
-            "No usable PDF attachment or .txt fallback is available for nutrition guidance."
-        )
-    update_knowledge_runtime_status(
-        triggered=True,
-        mode="failed",
-        errors=load_errors,
-    )
-    return [], warnings, "none"
+    st.session_state.knowledge_last_request_used = used_labels
+    st.session_state.knowledge_last_request_errors = errors
+    return parts
 
 
 def build_contents(
     messages: list[dict[str, str]],
     knowledge_parts: list[types.Part] | None = None,
-    knowledge_mode: str = "none",
 ) -> list[types.Content]:
     contents: list[types.Content] = []
 
     if knowledge_parts:
-        knowledge_intro = (
-            "Reference the attached dietary guidance documents when answering "
-            "nutrition, calorie, meal-balance, daily diet summary, or health-related "
-            "food questions. Use them as supporting knowledge, and say when advice is "
-            "a general guideline rather than a precise medical instruction."
-        )
-        if knowledge_mode == "txt":
-            knowledge_intro = (
-                "Reference the attached text summaries from the dietary guidance files "
-                "when answering nutrition, calorie, meal-balance, daily diet summary, "
-                "or health-related food questions. Use them as supporting knowledge, "
-                "and say when advice is a general guideline rather than a precise "
-                "medical instruction."
-            )
+        # When nutrition-related requests need guideline support, the uploaded PDF
+        # references are attached directly to the Gemini request here.
         contents.append(
             types.Content(
                 role="user",
-                parts=[types.Part.from_text(text=knowledge_intro), *knowledge_parts],
+                parts=[
+                    types.Part.from_text(
+                        text=(
+                            "Use the attached U.S. Dietary Guidelines and Chinese "
+                            "Dietary Guidelines as reference documents when relevant. "
+                            "If the documents do not contain enough information, say so "
+                            "instead of inventing details."
+                        )
+                    ),
+                    *knowledge_parts,
+                ],
             )
         )
 
@@ -337,27 +310,20 @@ def build_contents(
 
 def generate_reply(
     client: genai.Client,
-    api_key: str,
     model_name: str,
     messages: list[dict[str, str]],
     user_input: str,
 ) -> str:
     knowledge_parts: list[types.Part] = []
-    knowledge_mode = "none"
+    st.session_state.knowledge_last_request_used = []
+    st.session_state.knowledge_last_request_errors = []
+
     if should_use_knowledge(user_input, messages):
-        knowledge_parts, knowledge_warnings, knowledge_mode = get_knowledge_parts(api_key)
-        if knowledge_warnings:
-            st.session_state.knowledge_runtime_warnings = knowledge_warnings
-    else:
-        update_knowledge_runtime_status(triggered=False, mode="not-used")
+        knowledge_parts = get_attached_guideline_parts(client)
 
     response = client.models.generate_content(
         model=model_name,
-        contents=build_contents(
-            messages,
-            knowledge_parts=knowledge_parts,
-            knowledge_mode=knowledge_mode,
-        ),
+        contents=build_contents(messages, knowledge_parts=knowledge_parts),
         config=types.GenerateContentConfig(
             system_instruction=SYSTEM_PROMPT,
             temperature=0.3,
@@ -371,18 +337,7 @@ def clear_chat() -> None:
     st.session_state.messages = []
 
 
-def main() -> None:
-    st.set_page_config(page_title=APP_TITLE, page_icon="🍽️", layout="centered")
-    init_session_state()
-    init_knowledge_state()
-    st.session_state.knowledge_runtime_warnings = []
-
-    st.title(APP_TITLE)
-    st.caption(INTRO_TEXT)
-
-    knowledge_status = get_knowledge_status()
-    knowledge_runtime_status = st.session_state.knowledge_runtime_status
-
+def render_sidebar() -> None:
     with st.sidebar:
         st.subheader("About")
         st.write(
@@ -402,50 +357,36 @@ def main() -> None:
             st.rerun()
 
         st.subheader("Knowledge Status")
-        st.caption(
-            f"PDFs found: {len(knowledge_status['pdfs'])}/{len(KNOWLEDGE_PDF_FILES)}"
-        )
-        for pdf_name in KNOWLEDGE_PDF_FILES:
-            found = pdf_name in [path.name for path in knowledge_status["pdfs"]]
-            st.caption(f"{'Found' if found else 'Missing'}: {pdf_name}")
+        for spec in GUIDELINE_SPECS:
+            entry = st.session_state.knowledge_files.get(
+                spec["key"], default_knowledge_entry(spec)
+            )
+            st.caption(f"{entry['label']}: {entry['status']}")
+            if entry["status"] in {"missing", "upload failed"} and entry["error"]:
+                st.warning(f"{entry['label']}: {entry['error']}", icon="⚠️")
 
-        if knowledge_runtime_status["last_mode"] == "pdf":
-            st.success(
-                "Dietary PDFs were successfully attached to the latest nutrition-related Gemini request."
+        if st.session_state.knowledge_last_request_used:
+            st.caption(
+                "Used in latest nutrition request: "
+                + ", ".join(st.session_state.knowledge_last_request_used)
             )
-        elif knowledge_runtime_status["last_mode"] == "txt":
-            st.info(
-                "PDF attachment was not used for the latest nutrition-related request. Text fallback was loaded instead."
-            )
-        elif knowledge_runtime_status["last_mode"] == "failed":
-            st.warning(
-                "A nutrition-related request tried to load dietary knowledge, but neither PDF attachment nor text fallback succeeded."
+        elif st.session_state.knowledge_last_request_errors:
+            st.caption(
+                "Latest nutrition request could not use: "
+                + " | ".join(st.session_state.knowledge_last_request_errors)
             )
         else:
             st.caption(
-                "The dietary knowledge files are only loaded for nutrition-related questions."
+                "Guideline PDFs are attached only for nutrition-related questions."
             )
 
-        if knowledge_runtime_status["loaded_files"]:
-            st.caption(
-                "Attached to Gemini: "
-                + ", ".join(knowledge_runtime_status["loaded_files"])
-            )
-        if knowledge_runtime_status["fallback_files"]:
-            st.caption(
-                "Fallback text loaded: "
-                + ", ".join(knowledge_runtime_status["fallback_files"])
-            )
-        if knowledge_runtime_status["errors"]:
-            st.caption(
-                "Load notes: " + " | ".join(knowledge_runtime_status["errors"][:2])
-            )
 
-        if knowledge_status["missing_pdfs"]:
-            st.warning(
-                "Knowledge PDFs missing: " + ", ".join(knowledge_status["missing_pdfs"]),
-                icon="⚠️",
-            )
+def main() -> None:
+    st.set_page_config(page_title=APP_TITLE, page_icon="🍽️", layout="centered")
+    init_session_state()
+
+    st.title(APP_TITLE)
+    st.caption(INTRO_TEXT)
 
     api_key = st.secrets.get("GEMINI_API_KEY")
     if not api_key:
@@ -456,6 +397,8 @@ def main() -> None:
         st.stop()
 
     client = get_gemini_client(api_key)
+    bootstrap_knowledge_files(client)
+    render_sidebar()
 
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
@@ -474,7 +417,6 @@ def main() -> None:
             try:
                 reply = generate_reply(
                     client=client,
-                    api_key=api_key,
                     model_name=DEFAULT_MODEL,
                     messages=st.session_state.messages,
                     user_input=user_input,
@@ -491,11 +433,6 @@ def main() -> None:
         st.markdown(reply)
 
     st.session_state.messages.append({"role": "assistant", "content": reply})
-
-    if st.session_state.knowledge_runtime_warnings:
-        with st.sidebar:
-            for warning in st.session_state.knowledge_runtime_warnings:
-                st.caption(f"Knowledge note: {warning}")
 
 
 if __name__ == "__main__":
