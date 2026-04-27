@@ -12,8 +12,8 @@ from prompt import SYSTEM_PROMPT
 APP_TITLE = "Kitchen Assistant"
 DEFAULT_MODEL = "gemini-2.5-flash-lite"
 INTRO_TEXT = (
-    "This assistant helps you manage ingredients, get meal ideas, "
-    "reduce food waste, and estimate basic nutrition."
+    "Manage ingredients, get meal ideas, reduce food waste, "
+    "and estimate basic nutrition."
 )
 KNOWLEDGE_DIR = Path(__file__).parent / "knowledge"
 GUIDELINE_SPECS = [
@@ -77,6 +77,146 @@ NUTRITION_KEYWORDS = {
     "健康",
     "总结今天",
 }
+APP_CSS = """
+<style>
+:root {
+    --bg: #F5FAF8;
+    --sidebar-bg: #DCEFE7;
+    --primary: #4E9F8A;
+    --secondary: #F2C14E;
+    --text: #24312F;
+    --card: #FFFFFF;
+    --user-bubble: #FFF1C7;
+    --assistant-bubble: #DCEFE7;
+    --border: rgba(36, 49, 47, 0.12);
+}
+
+.stApp {
+    background: var(--bg);
+    color: var(--text);
+}
+
+[data-testid="stAppViewContainer"] {
+    background: var(--bg);
+}
+
+[data-testid="stSidebar"] {
+    background: var(--sidebar-bg);
+    border-right: 1px solid rgba(78, 159, 138, 0.12);
+}
+
+[data-testid="stSidebar"] > div:first-child {
+    background: var(--sidebar-bg);
+}
+
+[data-testid="block-container"] {
+    padding-top: 2rem;
+    padding-bottom: 2rem;
+    max-width: 46rem;
+}
+
+h1, h2, h3, p, label, div, span {
+    color: var(--text);
+}
+
+.hero-card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 20px;
+    padding: 1rem 1.1rem;
+    margin: 0.35rem 0 1.4rem;
+    box-shadow: 0 10px 30px rgba(78, 159, 138, 0.06);
+}
+
+.hero-card p {
+    margin: 0;
+    font-size: 1rem;
+    line-height: 1.6;
+}
+
+.sidebar-card {
+    background: rgba(255, 255, 255, 0.9);
+    border: 1px solid rgba(78, 159, 138, 0.12);
+    border-radius: 18px;
+    padding: 0.95rem 1rem;
+    margin-top: 0.8rem;
+    box-shadow: 0 10px 24px rgba(78, 159, 138, 0.06);
+}
+
+.sidebar-card-title {
+    font-weight: 700;
+    margin-bottom: 0.65rem;
+}
+
+[data-testid="stButton"] > button {
+    background: var(--primary);
+    color: white;
+    border: none;
+    border-radius: 999px;
+    padding: 0.65rem 1rem;
+    font-weight: 600;
+    box-shadow: 0 8px 20px rgba(78, 159, 138, 0.18);
+}
+
+[data-testid="stButton"] > button:hover {
+    background: #438a77;
+}
+
+[data-testid="stChatInput"] {
+    background: rgba(255, 255, 255, 0.92);
+    border: 1px solid var(--border);
+    border-radius: 18px;
+    padding: 0.2rem 0.4rem;
+    box-shadow: 0 8px 24px rgba(36, 49, 47, 0.05);
+}
+
+[data-testid="stChatInput"] textarea {
+    color: var(--text);
+}
+
+[data-testid="stChatMessage"] {
+    padding: 0.2rem 0;
+}
+
+[data-testid="stChatMessage"] [data-testid="stMarkdownContainer"] {
+    border-radius: 18px;
+    padding: 0.95rem 1rem;
+    line-height: 1.6;
+    box-shadow: 0 6px 20px rgba(36, 49, 47, 0.04);
+}
+
+[data-testid="stChatMessage"]:has([data-testid="chatAvatarIcon-user"]) [data-testid="stMarkdownContainer"] {
+    background: var(--user-bubble);
+}
+
+[data-testid="stChatMessage"]:has([data-testid="chatAvatarIcon-assistant"]) [data-testid="stMarkdownContainer"] {
+    background: var(--assistant-bubble);
+}
+
+[data-testid="stExpander"] {
+    background: rgba(255, 255, 255, 0.9);
+    border: 1px solid var(--border);
+    border-radius: 18px;
+    overflow: hidden;
+}
+
+.developer-note {
+    margin-top: 1.4rem;
+}
+
+@media (max-width: 768px) {
+    [data-testid="block-container"] {
+        padding-top: 1rem;
+        padding-left: 1rem;
+        padding-right: 1rem;
+    }
+
+    .hero-card {
+        margin-bottom: 1rem;
+    }
+}
+</style>
+"""
 
 
 def detect_message_language(text: str) -> str:
@@ -346,7 +486,7 @@ def render_sidebar() -> None:
             clear_chat()
             st.rerun()
 
-        st.subheader("Knowledge Status")
+        st.markdown('<div class="sidebar-card"><div class="sidebar-card-title">Knowledge Status</div>', unsafe_allow_html=True)
         for spec in GUIDELINE_SPECS:
             status = st.session_state.knowledge_status.get(spec["key"], {})
             st.caption(f"{spec['label']}: {status.get('status', 'missing')}")
@@ -360,31 +500,38 @@ def render_sidebar() -> None:
             )
         else:
             st.caption("Guideline text files are attached only for nutrition-related questions.")
+        st.markdown("</div>", unsafe_allow_html=True)
 
 
 def render_usage_footer() -> None:
     last_usage = st.session_state.last_usage
     session_usage = st.session_state.session_usage
 
-    st.divider()
-    st.caption(
-        "Token usage"
-        f" | Last request: prompt {last_usage['prompt_tokens']}, "
-        f"response {last_usage['response_tokens']}, total {last_usage['total_tokens']}"
-    )
-    st.caption(
-        f"Session total: prompt {session_usage['prompt_tokens']}, "
-        f"response {session_usage['response_tokens']}, total {session_usage['total_tokens']}"
-    )
+    st.markdown('<div class="developer-note">', unsafe_allow_html=True)
+    with st.expander("Developer info", expanded=False):
+        st.caption(
+            "Token usage"
+            f" | Last request: prompt {last_usage['prompt_tokens']}, "
+            f"response {last_usage['response_tokens']}, total {last_usage['total_tokens']}"
+        )
+        st.caption(
+            f"Session total: prompt {session_usage['prompt_tokens']}, "
+            f"response {session_usage['response_tokens']}, total {session_usage['total_tokens']}"
+        )
+    st.markdown("</div>", unsafe_allow_html=True)
 
 
 def main() -> None:
     st.set_page_config(page_title=APP_TITLE, page_icon="🍽️", layout="centered")
     init_session_state()
     load_knowledge_texts()
+    st.markdown(APP_CSS, unsafe_allow_html=True)
 
-    st.title(APP_TITLE)
-    st.caption(INTRO_TEXT)
+    st.title("🍳 Kitchen Assistant")
+    st.markdown(
+        f'<div class="hero-card"><p>{INTRO_TEXT}</p></div>',
+        unsafe_allow_html=True,
+    )
 
     api_key = st.secrets.get("GEMINI_API_KEY")
     if not api_key:
