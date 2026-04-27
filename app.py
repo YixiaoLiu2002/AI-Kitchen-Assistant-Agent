@@ -78,6 +78,13 @@ NUTRITION_KEYWORDS = {
 }
 
 
+def detect_message_language(text: str) -> str:
+    for char in text:
+        if "\u4e00" <= char <= "\u9fff":
+            return "zh"
+    return "en"
+
+
 def init_session_state() -> None:
     if "messages" not in st.session_state:
         st.session_state.messages = []
@@ -87,6 +94,8 @@ def init_session_state() -> None:
         st.session_state.knowledge_status = {}
     if "knowledge_last_request_used" not in st.session_state:
         st.session_state.knowledge_last_request_used = []
+    if "conversation_language" not in st.session_state:
+        st.session_state.conversation_language = None
 
 
 @st.cache_resource
@@ -159,8 +168,38 @@ def get_knowledge_context() -> tuple[str, list[str]]:
 def build_contents(
     messages: list[dict[str, str]],
     knowledge_text: str = "",
+    conversation_language: str | None = None,
 ) -> list[types.Content]:
     contents: list[types.Content] = []
+
+    if conversation_language == "zh":
+        contents.append(
+            types.Content(
+                role="user",
+                parts=[
+                    types.Part.from_text(
+                        text=(
+                            "For this conversation, use Chinese as the primary reply language. "
+                            "If you need to ask onboarding questions, ask them in Chinese."
+                        )
+                    )
+                ],
+            )
+        )
+    elif conversation_language == "en":
+        contents.append(
+            types.Content(
+                role="user",
+                parts=[
+                    types.Part.from_text(
+                        text=(
+                            "For this conversation, use English as the primary reply language. "
+                            "If you need to ask onboarding questions, ask them in English."
+                        )
+                    )
+                ],
+            )
+        )
 
     if knowledge_text:
         # Nutrition-related requests attach the local .txt guideline references here.
@@ -201,6 +240,10 @@ def generate_reply(
 ) -> str:
     knowledge_text = ""
     st.session_state.knowledge_last_request_used = []
+    conversation_language = st.session_state.conversation_language
+    if not conversation_language:
+        conversation_language = detect_message_language(user_input)
+        st.session_state.conversation_language = conversation_language
 
     if should_use_knowledge(user_input, messages):
         knowledge_text, used_labels = get_knowledge_context()
@@ -208,7 +251,11 @@ def generate_reply(
 
     response = client.models.generate_content(
         model=model_name,
-        contents=build_contents(messages, knowledge_text=knowledge_text),
+        contents=build_contents(
+            messages,
+            knowledge_text=knowledge_text,
+            conversation_language=conversation_language,
+        ),
         config=types.GenerateContentConfig(
             system_instruction=SYSTEM_PROMPT,
             temperature=0.3,
@@ -220,6 +267,7 @@ def generate_reply(
 
 def clear_chat() -> None:
     st.session_state.messages = []
+    st.session_state.conversation_language = None
 
 
 def render_sidebar() -> None:
