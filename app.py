@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
 
 import streamlit as st
 from google import genai
@@ -9,7 +10,7 @@ from google.genai import types
 from prompt import SYSTEM_PROMPT
 
 APP_TITLE = "Kitchen Assistant"
-DEFAULT_MODEL = "gemini-2.5-flash"
+DEFAULT_MODEL = "gemini-2.5-flash-lite"
 INTRO_TEXT = (
     "This assistant helps you manage ingredients, get meal ideas, "
     "reduce food waste, and estimate basic nutrition."
@@ -96,6 +97,18 @@ def init_session_state() -> None:
         st.session_state.knowledge_last_request_used = []
     if "conversation_language" not in st.session_state:
         st.session_state.conversation_language = None
+    if "last_usage" not in st.session_state:
+        st.session_state.last_usage = {
+            "prompt_tokens": 0,
+            "response_tokens": 0,
+            "total_tokens": 0,
+        }
+    if "session_usage" not in st.session_state:
+        st.session_state.session_usage = {
+            "prompt_tokens": 0,
+            "response_tokens": 0,
+            "total_tokens": 0,
+        }
 
 
 @st.cache_resource
@@ -237,7 +250,7 @@ def generate_reply(
     model_name: str,
     messages: list[dict[str, str]],
     user_input: str,
-) -> str:
+) -> tuple[str, dict[str, int]]:
     knowledge_text = ""
     st.session_state.knowledge_last_request_used = []
     conversation_language = st.session_state.conversation_language
@@ -262,12 +275,56 @@ def generate_reply(
             thinking_config=types.ThinkingConfig(thinking_budget=0),
         ),
     )
-    return (response.text or "").strip()
+
+    usage_metadata = getattr(response, "usage_metadata", None)
+    usage = {
+        "prompt_tokens": int(getattr(usage_metadata, "prompt_token_count", 0) or 0),
+        "response_tokens": int(getattr(usage_metadata, "candidates_token_count", 0) or 0),
+        "total_tokens": int(getattr(usage_metadata, "total_token_count", 0) or 0),
+    }
+    return (response.text or "").strip(), usage
+
+
+def format_api_error(exc: Exception) -> str:
+    raw_error = str(exc)
+    if "429" in raw_error and "RESOURCE_EXHAUSTED" in raw_error:
+        retry_match = re.search(r"retry in ([0-9.]+)s", raw_error, re.IGNORECASE)
+        retry_seconds = None
+        if retry_match:
+            retry_seconds = max(1, round(float(retry_match.group(1))))
+
+        if retry_seconds is not None:
+            return (
+                f"Rate limit reached for Gemini right now. Please wait about "
+                f"{retry_seconds} seconds and try again."
+            )
+        return "Rate limit reached for Gemini right now. Please wait a bit and try again."
+
+    return f"Sorry, I couldn't reach Gemini just now. Please try again.\n\nError: `{raw_error}`"
+
+
+def update_usage_state(usage: dict[str, int]) -> None:
+    st.session_state.last_usage = usage
+    st.session_state.session_usage = {
+        "prompt_tokens": st.session_state.session_usage["prompt_tokens"] + usage["prompt_tokens"],
+        "response_tokens": st.session_state.session_usage["response_tokens"] + usage["response_tokens"],
+        "total_tokens": st.session_state.session_usage["total_tokens"] + usage["total_tokens"],
+    }
 
 
 def clear_chat() -> None:
     st.session_state.messages = []
     st.session_state.conversation_language = None
+    st.session_state.last_usage = {
+        "prompt_tokens": 0,
+        "response_tokens": 0,
+        "total_tokens": 0,
+    }
+    st.session_state.session_usage = {
+        "prompt_tokens": 0,
+        "response_tokens": 0,
+        "total_tokens": 0,
+    }
 
 
 def render_sidebar() -> None:
@@ -305,6 +362,22 @@ def render_sidebar() -> None:
             st.caption("Guideline text files are attached only for nutrition-related questions.")
 
 
+def render_usage_footer() -> None:
+    last_usage = st.session_state.last_usage
+    session_usage = st.session_state.session_usage
+
+    st.divider()
+    st.caption(
+        "Token usage"
+        f" | Last request: prompt {last_usage['prompt_tokens']}, "
+        f"response {last_usage['response_tokens']}, total {last_usage['total_tokens']}"
+    )
+    st.caption(
+        f"Session total: prompt {session_usage['prompt_tokens']}, "
+        f"response {session_usage['response_tokens']}, total {session_usage['total_tokens']}"
+    )
+
+
 def main() -> None:
     st.set_page_config(page_title=APP_TITLE, page_icon="🍽️", layout="centered")
     init_session_state()
@@ -330,6 +403,7 @@ def main() -> None:
 
     user_input = st.chat_input("Ask about your ingredients, meals, or pantry...")
     if not user_input:
+        render_usage_footer()
         return
 
     st.session_state.messages.append({"role": "user", "content": user_input})
@@ -339,17 +413,15 @@ def main() -> None:
     with st.chat_message("assistant"):
         with st.spinner("Thinking..."):
             try:
-                reply = generate_reply(
+                reply, usage = generate_reply(
                     client=client,
                     model_name=DEFAULT_MODEL,
                     messages=st.session_state.messages,
                     user_input=user_input,
                 )
+                update_usage_state(usage)
             except Exception as exc:
-                reply = (
-                    "Sorry, I couldn't reach Gemini just now. "
-                    f"Please try again.\n\nError: `{exc}`"
-                )
+                reply = format_api_error(exc)
 
         if not reply:
             reply = "I don't have a response yet. Please try rephrasing that."
@@ -357,6 +429,7 @@ def main() -> None:
         st.markdown(reply)
 
     st.session_state.messages.append({"role": "assistant", "content": reply})
+    render_usage_footer()
 
 
 if __name__ == "__main__":

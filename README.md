@@ -48,6 +48,7 @@ GEMINI_API_KEY = "your-api-key-here"
 ## Notes
 
 - The API key is loaded from `st.secrets["GEMINI_API_KEY"]`.
+- The default model is `gemini-2.5-flash-lite`.
 - No database, login, long-term storage, or external memory layer is included yet.
 - Nutrition and diet-related questions now use local text knowledge files from `knowledge/`.
 - Expected text files are `us_dietary_guidelines.txt` and `chinese_dietary_guidelines.txt`.
