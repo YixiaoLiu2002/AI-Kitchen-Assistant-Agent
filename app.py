@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import re
+import time
 
 import streamlit as st
 from google import genai
@@ -10,7 +11,10 @@ from google.genai import types
 from prompt import SYSTEM_PROMPT
 
 APP_TITLE = "Kitchen Assistant"
-DEFAULT_MODEL = "gemini-2.5-flash-lite"
+DEFAULT_MODEL = "models/gemini-2.5-flash-lite"
+FALLBACK_MODELS = ("models/gemini-2.0-flash-lite",)
+HISTORY_WINDOW_CANDIDATES = (None, 24, 12, 6, 2)
+RETRY_DELAYS_SECONDS = (1.0,)
 INTRO_TEXT = (
     "Manage ingredients, get meal ideas, reduce food waste, "
     "and estimate basic nutrition."
@@ -271,6 +275,10 @@ def init_session_state() -> None:
             "response_tokens": 0,
             "total_tokens": 0,
         }
+    if "last_model_used" not in st.session_state:
+        st.session_state.last_model_used = DEFAULT_MODEL
+    if "last_request_notes" not in st.session_state:
+        st.session_state.last_request_notes = []
 
 
 @st.cache_resource
@@ -407,12 +415,56 @@ def build_contents(
     return contents
 
 
+def get_recent_messages(
+    messages: list[dict[str, str]],
+    max_messages: int | None,
+) -> list[dict[str, str]]:
+    if max_messages is None or len(messages) <= max_messages:
+        return messages
+    return messages[-max_messages:]
+
+
+def is_context_limit_error(raw_error: str) -> bool:
+    normalized = raw_error.lower()
+    patterns = (
+        "maximum context length",
+        "context window",
+        "input token limit",
+        "too many tokens",
+        "token limit exceeded",
+        "request payload size exceeds the limit",
+        "prompt is too long",
+    )
+    return any(pattern in normalized for pattern in patterns)
+
+
+def is_retryable_model_error(raw_error: str) -> bool:
+    normalized = raw_error.lower()
+    retryable_markers = (
+        "resource_exhausted",
+        "rate limit",
+        "quota",
+        "unavailable",
+        "internal",
+        "deadline exceeded",
+        "503",
+        "500",
+        "429",
+    )
+    return any(marker in normalized for marker in retryable_markers)
+
+
+def is_service_unavailable_error(raw_error: str) -> bool:
+    normalized = raw_error.lower()
+    return "503" in normalized or "unavailable" in normalized
+
+
 def generate_reply(
     client: genai.Client,
     model_name: str,
     messages: list[dict[str, str]],
     user_input: str,
-) -> tuple[str, dict[str, int]]:
+) -> tuple[str, dict[str, int], str, list[str]]:
     knowledge_text = ""
     st.session_state.knowledge_last_request_used = []
     conversation_language = st.session_state.conversation_language
@@ -424,31 +476,91 @@ def generate_reply(
         knowledge_text, used_labels = get_knowledge_context()
         st.session_state.knowledge_last_request_used = used_labels
 
-    response = client.models.generate_content(
-        model=model_name,
-        contents=build_contents(
-            messages,
-            knowledge_text=knowledge_text,
-            conversation_language=conversation_language,
-        ),
-        config=types.GenerateContentConfig(
-            system_instruction=SYSTEM_PROMPT,
-            temperature=0.3,
-            thinking_config=types.ThinkingConfig(thinking_budget=0),
-        ),
-    )
+    model_chain = (model_name, *FALLBACK_MODELS)
+    last_error: Exception | None = None
 
-    usage_metadata = getattr(response, "usage_metadata", None)
-    usage = {
-        "prompt_tokens": int(getattr(usage_metadata, "prompt_token_count", 0) or 0),
-        "response_tokens": int(getattr(usage_metadata, "candidates_token_count", 0) or 0),
-        "total_tokens": int(getattr(usage_metadata, "total_token_count", 0) or 0),
-    }
-    return (response.text or "").strip(), usage
+    for candidate_model in model_chain:
+        for history_window in HISTORY_WINDOW_CANDIDATES:
+            request_notes: list[str] = []
+            message_slice = get_recent_messages(messages, history_window)
+            if history_window is not None and len(message_slice) < len(messages):
+                request_notes.append(
+                    f"Trimmed chat history to the most recent {len(message_slice)} messages "
+                    "to fit the request."
+                )
+
+            for retry_index in range(len(RETRY_DELAYS_SECONDS) + 1):
+                try:
+                    response = client.models.generate_content(
+                        model=candidate_model,
+                        contents=build_contents(
+                            message_slice,
+                            knowledge_text=knowledge_text,
+                            conversation_language=conversation_language,
+                        ),
+                        config=types.GenerateContentConfig(
+                            system_instruction=SYSTEM_PROMPT,
+                            temperature=0.3,
+                            thinking_config=types.ThinkingConfig(thinking_budget=0),
+                        ),
+                    )
+                    if candidate_model != model_name:
+                        request_notes.append(
+                            f"Automatically fell back to `{candidate_model}` for this request."
+                        )
+                    if retry_index > 0:
+                        request_notes.append(
+                            f"Retried this request {retry_index} time(s) after temporary Gemini availability issues."
+                        )
+
+                    usage_metadata = getattr(response, "usage_metadata", None)
+                    usage = {
+                        "prompt_tokens": int(getattr(usage_metadata, "prompt_token_count", 0) or 0),
+                        "response_tokens": int(
+                            getattr(usage_metadata, "candidates_token_count", 0) or 0
+                        ),
+                        "total_tokens": int(getattr(usage_metadata, "total_token_count", 0) or 0),
+                    }
+                    return (response.text or "").strip(), usage, candidate_model, request_notes
+                except Exception as exc:
+                    last_error = exc
+                    raw_error = str(exc)
+
+                    if is_context_limit_error(raw_error):
+                        if history_window != HISTORY_WINDOW_CANDIDATES[-1]:
+                            break
+                        if history_window == HISTORY_WINDOW_CANDIDATES[-1]:
+                            break
+
+                    if is_service_unavailable_error(raw_error) and retry_index < len(RETRY_DELAYS_SECONDS):
+                        time.sleep(RETRY_DELAYS_SECONDS[retry_index])
+                        continue
+
+                    if is_retryable_model_error(raw_error) and candidate_model != model_chain[-1]:
+                        break
+
+                    if is_context_limit_error(raw_error) and history_window == HISTORY_WINDOW_CANDIDATES[-1]:
+                        break
+
+                    raise
+
+            if last_error is not None and is_context_limit_error(str(last_error)):
+                continue
+
+    if last_error is not None:
+        raise last_error
+
+    raise RuntimeError("No Gemini model attempts were made.")
 
 
 def format_api_error(exc: Exception) -> str:
     raw_error = str(exc)
+    if is_context_limit_error(raw_error):
+        return (
+            "This request is still too large for Gemini after trimming recent chat history. "
+            "Please start a new chat or send a shorter request."
+        )
+
     if "429" in raw_error and "RESOURCE_EXHAUSTED" in raw_error:
         retry_match = re.search(r"retry in ([0-9.]+)s", raw_error, re.IGNORECASE)
         retry_seconds = None
@@ -461,6 +573,12 @@ def format_api_error(exc: Exception) -> str:
                 f"{retry_seconds} seconds and try again."
             )
         return "Rate limit reached for Gemini right now. Please wait a bit and try again."
+
+    if is_service_unavailable_error(raw_error):
+        return (
+            "Gemini is temporarily under heavy demand. The app already retried and, if possible, "
+            "fell back to a lighter model, but this request still did not go through. Please try again shortly."
+        )
 
     return f"Sorry, I couldn't reach Gemini just now. Please try again.\n\nError: `{raw_error}`"
 
@@ -487,6 +605,8 @@ def clear_chat() -> None:
         "response_tokens": 0,
         "total_tokens": 0,
     }
+    st.session_state.last_model_used = DEFAULT_MODEL
+    st.session_state.last_request_notes = []
 
 
 def render_sidebar() -> None:
@@ -539,9 +659,13 @@ def render_sidebar() -> None:
 def render_usage_footer() -> None:
     last_usage = st.session_state.last_usage
     session_usage = st.session_state.session_usage
+    last_model_used = st.session_state.last_model_used
 
     st.markdown('<div class="developer-note">', unsafe_allow_html=True)
     with st.expander("Developer info", expanded=False):
+        st.caption(f"Model: {last_model_used}")
+        for note in st.session_state.last_request_notes:
+            st.caption(note)
         st.caption(
             "Token usage"
             f" | Last request: prompt {last_usage['prompt_tokens']}, "
@@ -593,14 +717,18 @@ def main() -> None:
     with st.chat_message("assistant"):
         with st.spinner("Thinking..."):
             try:
-                reply, usage = generate_reply(
+                reply, usage, model_used, request_notes = generate_reply(
                     client=client,
                     model_name=DEFAULT_MODEL,
                     messages=st.session_state.messages,
                     user_input=user_input,
                 )
+                st.session_state.last_model_used = model_used
+                st.session_state.last_request_notes = request_notes
                 update_usage_state(usage)
             except Exception as exc:
+                st.session_state.last_model_used = DEFAULT_MODEL
+                st.session_state.last_request_notes = []
                 reply = format_api_error(exc)
 
         if not reply:
