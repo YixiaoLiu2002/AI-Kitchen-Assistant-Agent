@@ -1,6 +1,7 @@
 # Kitchen Assistant
 
 A minimal Streamlit chatbot for a Gemini-based kitchen assistant.
+Access the site here: [Kitchen Assistant](https://ai-kitchen-assistant-agent.streamlit.app/)
 
 ## Features
 
